@@ -19,13 +19,14 @@ This document turns [PRD.md](./PRD.md) into a concrete design. It covers the dat
 ```mermaid
 flowchart LR
     A["Upload file"] --> B["OCR (Tesseract)"]
-    B --> C["LLM extraction (Gemini)"]  
-    C --> D["Delete raw file"]
-    D --> E["Save extracted fields (IDs masked)"]
-    E --> F["User reviews / edits"]
-    F --> G["Rule engine (plain Python)"]
-    G --> H["Report + overall status"]
-    H -->|"edit and re-run"| F
+    B --> C["Local regex: extract & redact PAN/Aadhaar"]
+    C --> D["LLM extraction (Gemini)"]
+    D --> E["Delete raw file"]
+    E --> F["Save extracted fields (IDs masked)"]
+    F --> G["User reviews / edits"]
+    G --> H["Rule engine (plain Python)"]
+    H --> I["Report + overall status"]
+    I -->|"edit and re-run"| G
 ```
 
 ### Check status lifecycle
@@ -64,27 +65,28 @@ All primary keys are UUIDs. All tables have `created_at` and `updated_at` (times
 | ocr_engine | text | e.g. `tesseract-5` |
 | ocr_confidence | numeric(5,2) NULL | Mean word confidence, 0–100 |
 | readability | jsonb | `{ "width", "height", "blur_score", "brightness", "readable": bool }` |
-| fields | jsonb | Extracted values (shape depends on label, see Section 4). Sensitive IDs stored masked |
-| field_meta | jsonb | Per field: `{ "confidence", "edited": bool, "source": "llm" or "user" }` |
-| id_format_valid | boolean NULL | KYC only. Result of the format/checksum check on the full ID, done before masking |
-| id_hash | text NULL | KYC only. Salted SHA-256 of the full ID number, for cross-document matching without storing the number |
+| fields | jsonb NULL | **KYC only.** Extracted values (shape depends on label, see Section 4.2). Sensitive IDs stored masked. `NULL` for invoice documents (`invoices` and `invoice_line_items` are the source of truth for invoices) |
+| field_meta | jsonb | Per field: `{ "confidence", "edited": bool, "source": "regex" \| "llm" \| "user" }` |
+| id_format_valid | boolean NULL | KYC only. Result of the format/checksum check on the ID number, computed before masking. For masked Aadhaar (`XXXX-XXXX-1234`), `true` if the last 4 digits are valid (checksum skipped) |
+| id_hash | text NULL | KYC only (optional). `HMAC-SHA256(ID_HASH_SECRET, full_id)` using a secret key from `.env`, computed before masking so duplicate/matching ID checks can run without storing the raw number. `NULL` when the uploaded Aadhaar is already masked |
 
 > The raw file and the full OCR text are **never** written to the database or disk long-term. The file sits in a temp folder only during extraction and is deleted in a `finally` block.
 
 ### 2.3 `invoices`
 
-Typed columns (not just jsonb) so duplicate lookups and indexing work. One row per invoice document.
+The `invoices` and `invoice_line_items` tables are the **single source of truth** for invoice extracted fields and user edits (invoice fields are not duplicated in `documents.fields`). Typed columns allow indexing and SQL duplicate lookups. One row per invoice document.
 
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid PK | |
-| check_id | uuid FK → checks | |
-| document_id | uuid FK → documents (unique) | |
-| invoice_number | text | Normalised (trimmed, uppercased) for matching |
+| check_id | uuid FK → checks (cascade delete) | |
+| document_id | uuid FK → documents (unique, cascade delete) | |
+| invoice_number | text NULL | Normalised (trimmed, uppercased) for matching |
 | invoice_date | date NULL | |
 | due_date | date NULL | |
-| vendor_name | text | |
-| vendor_gstin | text | Normalised uppercase |
+| vendor_name | text NULL | |
+| vendor_gstin | text NULL | Normalised uppercase |
+| vendor_address | text NULL | |
 | buyer_name | text NULL | |
 | buyer_gstin | text NULL | |
 | place_of_supply | text NULL | State name or 2-digit state code |
@@ -141,26 +143,29 @@ erDiagram
 
 ### 2.7 Data handling
 
-- **Masking:** IDs are stored with only the **last 4 characters visible**: PAN `******234F`, Aadhaar `XXXX-XXXX-1234`, passport/DL `******1234`.
-- **Format checks before masking:** The full ID only exists in memory during extraction or edit. The result goes into `id_format_valid`, and `id_hash` is used for matching.
-- **Editing an ID:** The user re-types the full number. It is validated, hashed and masked, then thrown away.
-- **Invoices:** GSTIN and invoice data are business data, not personal IDs, so they are stored in full (they are needed for duplicate detection).
+- **Local regex extraction & LLM redaction:** PAN and Aadhaar numbers are extracted from the OCR text using local regexes and redacted (`[REDACTED_PAN]`, `[REDACTED_AADHAAR]`) **before** the OCR text is sent to the LLM. The LLM never receives raw PAN or Aadhaar numbers.
+- **Masking:** IDs are stored in `documents.fields` with only the **last 4 characters visible**: PAN `******234F`, Aadhaar `XXXX-XXXX-1234`, passport/DL `******1234`.
+- **Masked Aadhaar support:** If the uploaded Aadhaar card is already masked on the document (e.g. `XXXX-XXXX-1234` or `********1234`), the starting-digit and Verhoeff checksum checks are skipped, `id_format_valid` is set to `true` (provided the last 4 characters are digits), `id_hash` is left `NULL`, and no validation issue is raised.
+- **Format checks & HMAC before masking:** The full ID only exists in memory during local extraction or user edit. Format/checksum validation runs in memory and sets `id_format_valid`. When a full ID is present, `id_hash` is computed as `HMAC-SHA256(ID_HASH_SECRET, full_id)` using a secret key from `.env` (never plain or unsalted SHA-256, because the 12-digit Aadhaar keyspace is small enough to brute-force).
+- **Editing an ID:** The user re-types the full number (or masked Aadhaar). It is validated, HMAC-hashed (if unmasked), and masked in memory; the raw input is discarded.
+- **Invoices:** `invoices` and `invoice_line_items` are the sole source of truth for invoice fields (`documents.fields` is `NULL` for invoices). GSTIN and invoice data are business data, not personal IDs, so they are stored in full (needed for duplicate detection).
+- **Retention:** Invoice rows are kept for duplicate detection (`INV-DUP-001`). KYC checks and their cascaded documents/issues are auto-deleted after a configurable number of days (`KYC_RETENTION_DAYS` in `.env`, default `7`).
 
 ---
 
 ## 3. API Endpoints (FastAPI, prefix `/api`)
 
-There is no authentication in the MVP. Request and response bodies are JSON unless marked multipart.
+There is no authentication in the MVP (local use with synthetic sample documents only). **Authentication is required before any public deployment.** Request and response bodies are JSON unless marked multipart.
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness check. Also reports which OCR and LLM providers are configured |
 | POST | `/checks` | Create a check. Body: `{ "doc_type": "invoice" or "kyc" }` |
 | GET | `/checks` | List recent checks (id, type, status, overall_status, created_at). Feeds the nice-to-have history screen |
-| GET | `/checks/{check_id}` | Full check: documents, extracted fields (masked), status |
+| GET | `/checks/{check_id}` | Full check: documents, extracted fields (from `invoices`/`invoice_line_items` for invoices, or masked `documents.fields` for KYC), status |
 | DELETE | `/checks/{check_id}` | Delete a check and all its data |
-| POST | `/checks/{check_id}/documents` | **Multipart.** Fields: `file`, `label`. Runs OCR + extraction synchronously, deletes the file, returns the document with extracted fields |
-| PATCH | `/checks/{check_id}/documents/{document_id}` | Edit extracted fields. Body: `{ "fields": { ... } }`. Sets `report_stale = true` |
+| POST | `/checks/{check_id}/documents` | **Multipart.** Fields: `file`, `label`. Runs OCR + local ID regex/redaction + LLM extraction synchronously, deletes the file, returns the document with extracted fields |
+| PATCH | `/checks/{check_id}/documents/{document_id}` | Edit extracted fields. Body: `{ "fields": { ... } }`. Updates `invoices` + `invoice_line_items` for invoices, or `documents.fields` for KYC. Sets `report_stale = true` |
 | PUT | `/checks/{check_id}/documents/{document_id}/label` | Change a KYC file label (fields are re-mapped; re-extraction may be needed) |
 | POST | `/checks/{check_id}/documents/{document_id}/reextract` | Re-upload a file for an existing document slot (multipart `file`) |
 | DELETE | `/checks/{check_id}/documents/{document_id}` | Remove a document from the check |
@@ -170,6 +175,7 @@ There is no authentication in the MVP. Request and response bodies are JSON unle
 
 ### Upload limits
 - Allowed types: PDF, JPG, PNG.
+- Password-protected / encrypted PDFs are rejected immediately with `PASSWORD_PROTECTED_PDF`.
 - Max size: 10 MB per file. Max pages: 5 per PDF (MVP).
 - Invoice check: 1–10 files. KYC check: 1 file per label (except `address_proof`, which is limited to 1 in the MVP).
 
@@ -177,6 +183,10 @@ There is no authentication in the MVP. Request and response bodies are JSON unle
 
 ```json
 { "error": { "code": "UNSUPPORTED_FILE_TYPE", "message": "Only PDF, JPG and PNG files are allowed." } }
+```
+
+```json
+{ "error": { "code": "PASSWORD_PROTECTED_PDF", "message": "Password-protected PDFs are not supported. Please upload an unlocked PDF." } }
 ```
 
 ### Example report response (shape only)
@@ -206,15 +216,19 @@ There is no authentication in the MVP. Request and response bodies are JSON unle
 
 ## 4. Extraction Fields
 
-The LLM gets the OCR text plus a label-specific JSON schema and must return JSON only. Every field may be `null` if it is not found. Pydantic validates the output. Dates are normalised to ISO `YYYY-MM-DD` and amounts to decimal numbers.
+Before calling the LLM, a local regex pass extracts PAN and Aadhaar numbers (full or masked) from the OCR text and replaces them with `[REDACTED_PAN]` / `[REDACTED_AADHAAR]`. The LLM then receives the redacted OCR text plus a label-specific JSON schema and must return JSON only. Every field may be `null` if it is not found. Pydantic validates the output.
+
+**Date parsing:** Dates on documents are parsed as **`DD/MM/YYYY` (Indian day-first format**, also supporting `DD-MM-YYYY` and `DD Mon YYYY`) and normalised to ISO `YYYY-MM-DD` for storage and validation. Amounts are normalised to decimal numbers.
 
 ### 4.1 Invoice
+
+Persisted in `invoices` and `invoice_line_items` (not in `documents.fields`).
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | invoice_number | string | Yes | |
-| invoice_date | date | Yes | |
-| due_date | date | No | |
+| invoice_date | date | Yes | Parsed as `DD/MM/YYYY` → stored as `YYYY-MM-DD` |
+| due_date | date | No | Parsed as `DD/MM/YYYY` → stored as `YYYY-MM-DD` |
 | vendor_name | string | Yes | |
 | vendor_gstin | string | Yes | 15 characters |
 | vendor_address | string | No | |
@@ -232,10 +246,12 @@ The LLM gets the OCR text plus a label-specific JSON schema and must return JSON
 
 ### 4.2 KYC (per label)
 
+Persisted in `documents.fields` (with ID numbers masked). PAN and Aadhaar numbers are extracted locally via regex rather than by the LLM.
+
 | Label | Fields | Required fields |
 |---|---|---|
-| **pan** | name, father_name, dob, pan_number | name, pan_number, dob |
-| **aadhaar** | name, dob (or year_of_birth), gender, aadhaar_number, address | name, aadhaar_number, dob |
+| **pan** | name, father_name, dob, pan_number (via local regex) | name, pan_number, dob |
+| **aadhaar** | name, dob (or year_of_birth), gender, aadhaar_number (via local regex; full or masked), address | name, aadhaar_number, dob |
 | **address_proof** | name, address, document_kind (electricity / water / gas / telecom / bank statement / other), issue_date (bill date) | name, address, issue_date |
 | **passport** | name, dob, passport_number, nationality, issue_date, expiry_date, address (optional) | name, passport_number, dob, expiry_date |
 | **driving_licence** | name, dob, dl_number, issue_date, expiry_date (valid till), address | name, dl_number, dob, expiry_date |
@@ -282,14 +298,14 @@ The LLM gets the OCR text plus a label-specific JSON schema and must return JSON
 | INV-TAX-002 | Both IGST and CGST/SGST charged on the same invoice | High |
 | INV-TAX-003 | CGST ≠ SGST (beyond ±1) | High |
 | INV-TAX-004 | Wrong tax type for the supply: vendor state (GSTIN digits 1–2) equals place of supply but IGST was charged, or the states differ but CGST+SGST was charged | Medium |
-| INV-TAX-005 | Line tax rate not in the allowed GST rate list (configurable, e.g. 0, 0.25, 3, 5, 12, 18, 28, 40) | Low |
+| INV-TAX-005 | Line tax rate not in the allowed GST rate list for the `invoice_date` (configurable by effective date range, e.g. 0, 0.25, 3, 5, 12, 18, 28, 40) | Low |
 | **GSTIN** | | |
 | INV-GST-001 | Vendor GSTIN format invalid (regex `^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$`) | High |
 | INV-GST-002 | Vendor GSTIN checksum (15th character) invalid | High |
 | INV-GST-003 | Vendor GSTIN state code not a valid Indian state/UT code | High |
 | INV-GST-004 | Buyer GSTIN present but invalid (format, checksum or state) | Medium |
 | **Duplicates** | | |
-| INV-DUP-001 | Same invoice number + vendor GSTIN already exists in an earlier check | High |
+| INV-DUP-001 | Same invoice number + vendor GSTIN already exists in another check (`invoices.check_id != current_check_id`, excluding the current check's own rows) | High |
 | INV-DUP-002 | Same invoice number + vendor GSTIN appears twice in this upload | High |
 | **Dates** | | |
 | INV-DATE-001 | Invoice date is in the future | High |
@@ -317,7 +333,7 @@ The LLM gets the OCR text plus a label-specific JSON schema and must return JSON
 | **ID format** | | |
 | KYC-FMT-001 | PAN format invalid (`^[A-Z]{5}[0-9]{4}[A-Z]$`) | High |
 | KYC-FMT-002 | PAN 4th character is not `P` (not an individual's PAN) | Medium |
-| KYC-FMT-003 | Aadhaar not 12 digits, starts with 0 or 1, or fails the Verhoeff checksum | High |
+| KYC-FMT-003 | Full Aadhaar not 12 digits, starts with 0 or 1, or fails the Verhoeff checksum. If the Aadhaar is masked (`XXXX-XXXX-1234` / `********1234`), the starting-digit and Verhoeff checksum checks are skipped and no issue is raised as long as the last 4 digits are present | High |
 | KYC-FMT-004 | Passport number format invalid (`^[A-PR-WY][1-9][0-9]{5}[1-9]$`) | High |
 | KYC-FMT-005 | DL number format invalid (state code + RTO code + year + serial, 15–16 characters after removing spaces and hyphens) | Medium |
 | **Cross-document match** | | |
@@ -407,11 +423,10 @@ backend/
 │   │       ├── reports.py
 │   │       └── rules.py
 │   ├── services/
-│   │   ├── pipeline.py          # Orchestrates: save temp → OCR → LLM → delete → persist
+│   │   ├── pipeline.py          # Orchestrates: save temp → OCR → regex redact IDs → LLM → delete → persist
 │   │   ├── ocr/
 │   │   │   ├── base.py          # OCRProvider interface
-│   │   │   ├── tesseract.py
-│   │   │   └── paddle.py
+│   │   │   └── tesseract.py     # Tesseract implementation (MVP)
 │   │   ├── llm/
 │   │   │   ├── base.py          # LLMProvider interface (extract_json, explain)
 │   │   │   ├── gemini.py
@@ -420,7 +435,7 @@ backend/
 │   │   │   ├── invoice.py
 │   │   │   └── kyc.py
 │   │   ├── imaging/
-│   │   │   ├── preprocess.py    # PDF→image, deskew, grayscale
+│   │   │   ├── preprocess.py    # PDF→image (rejects password-protected PDFs), deskew, grayscale
 │   │   │   └── quality.py       # Blur, brightness, resolution
 │   │   └── storage/
 │   │       └── temp_files.py    # Temp save + guaranteed delete
@@ -443,17 +458,17 @@ backend/
 │   │       ├── expiry.py
 │   │       └── quality.py
 │   └── utils/
-│       ├── masking.py
-│       ├── hashing.py
+│       ├── redaction.py         # Local regex extraction & redaction of PAN / Aadhaar before LLM
+│       ├── masking.py           # Last-4-character masking
+│       ├── hashing.py           # HMAC-SHA256 with ID_HASH_SECRET from .env
 │       ├── gstin.py             # Format, checksum, state codes
-│       ├── verhoeff.py          # Aadhaar checksum
+│       ├── verhoeff.py          # Aadhaar checksum (skipped when Aadhaar is masked)
 │       ├── names.py             # Normalise + fuzzy match
-│       ├── dates.py
+│       ├── dates.py             # Parse DD/MM/YYYY (Indian format) → ISO YYYY-MM-DD
 │       └── money.py             # Decimal helpers, tolerance compare
 ├── alembic/                     # DB migrations
 ├── scripts/
-│   ├── generate_samples.py      # Synthetic invoices/KYC with planted errors + answer key
-│   └── benchmark_ocr.py         # Tesseract vs PaddleOCR on samples
+│   └── generate_samples.py      # Synthetic invoices/KYC with planted errors + answer key
 ├── tests/
 │   ├── unit/                    # One test file per rule module + utils
 │   ├── integration/             # API + DB
@@ -518,26 +533,36 @@ The stepper is visible on screens 2–6: **Upload → Extract → Review → Val
 
 ## 8. Provider Interfaces (conceptual)
 
-- **OCRProvider:** `extract_text(image) → { text, words[{text, confidence, bbox}], mean_confidence }`. Implementations: Tesseract (default), PaddleOCR. Selected via the `OCR_PROVIDER` env var.
-- **LLMProvider:** `extract_fields(ocr_text, schema, label) → dict` and optionally `rephrase(issue) → str`. Implementation: Gemini (default). Selected via `LLM_PROVIDER`. Requests use JSON mode / structured output with a low temperature.
+- **OCRProvider:** `extract_text(image) → { text, words[{text, confidence, bbox}], mean_confidence }`. Implementation: **Tesseract only** for the MVP (kept behind the `OCRProvider` interface so alternative engines can be added post-MVP).
+- **LLMProvider:** `extract_fields(redacted_ocr_text, schema, label) → dict` and optionally `rephrase(issue) → str`. Implementation: Gemini (default). Selected via `LLM_PROVIDER`. Requests use JSON mode / structured output with a low temperature. Raw PAN and Aadhaar numbers are redacted from `redacted_ocr_text` before calling the provider.
 
 ---
 
 ## 9. Testing Plan (summary)
 
-- **Unit tests:** every rule (pass case and fail case), GSTIN checksum, Verhoeff, name matcher, masking, money tolerance.
-- **Synthetic samples:** `generate_samples.py` creates clean and faulty invoices/KYC sets as PDF and images, plus an `answer_key.json` listing the planted errors and expected field values.
+- **Unit tests:** every rule (pass case and fail case), GSTIN checksum, Verhoeff (including masked Aadhaar bypass), local ID regex & redaction, HMAC hashing, name matcher, masking, `DD/MM/YYYY` date parser, money tolerance.
+- **Synthetic samples:** `generate_samples.py` creates clean and faulty invoices/KYC sets as PDF (including a password-protected PDF test case) and images, plus an `answer_key.json` listing the planted errors and expected field values.
 - **Success metrics (from the PRD):**
   - Field extraction accuracy ≥ 90% against the answer key.
   - 100% of planted errors caught (each expected rule code is present).
-- **OCR benchmark:** run Tesseract and PaddleOCR on the same samples. Compare field accuracy and speed, then record the decision in the PRD.
 
 ---
 
-## 10. Open Questions
+## 10. Build Milestones
 
-1. **Address proof vs Aadhaar:** Aadhaar contains an address. Should an Aadhaar be accepted as the address proof if no separate address proof is uploaded, or is a separate address proof always required? (Current design: always required.)
-2. **Address match:** should we compare the Aadhaar address with the address proof? (Not in the current rule list. It could be added as a Low or Medium rule.)
-3. **Allowed GST rates:** confirm the rate list for INV-TAX-005, given recent GST rate changes. Kept configurable.
-4. **Extraction mode:** synchronous extraction per upload is simplest for the MVP (a few seconds per file). Is that acceptable, or do you want a background job with polling from the start?
-5. **Data retention for extracted fields:** keep them indefinitely (needed for duplicate checks), or auto-delete KYC checks after N days?
+| Milestone | Scope |
+|---|---|
+| **M1** | **Upload, OCR, extract, show fields:** Create check, upload PDF/JPG/PNG (reject password-protected PDFs), run Tesseract OCR, run LLM field extraction, delete raw file, persist invoice rows, and show extracted fields on the Review screen. |
+| **M2** | **Invoice core validation:** Implement invoice required-field (`INV-REQ-*`), arithmetic (`INV-MATH-*`), and GSTIN (`INV-GST-*`) rules, plus the Report screen with overall status. |
+| **M3** | **Invoice full validation + edit & re-validate:** Implement invoice tax (`INV-TAX-*`), duplicate (`INV-DUP-*`, excluding the current check's own rows), date (`INV-DATE-*`, `DD/MM/YYYY`), and OCR quality (`INV-READ-001`) rules, plus editing extracted invoice fields/line items and re-running validation. |
+| **M4** | **KYC module:** Labelled KYC document upload, local regex extraction & pre-LLM redaction for PAN/Aadhaar, masked Aadhaar handling, HMAC-SHA256 `id_hash`, OpenCV image readability, all KYC rules (`KYC-DOC-*`, `KYC-REQ-*`, `KYC-FMT-*`, `KYC-MATCH-*`, `KYC-EXP-*`, `KYC-READ-*`), and configurable KYC retention cleanup. |
+
+---
+
+## 11. Resolved Decisions
+
+1. **Address proof vs Aadhaar:** A separate address proof is **always required** for the MVP (`KYC-DOC-003`). Accepting Aadhaar as the address proof is deferred.
+2. **Address matching:** **Skipped** for the MVP. Comparing the Aadhaar address with the address proof can be added later as a Low rule.
+3. **Allowed GST rates (`INV-TAX-005`):** The allowed GST rate list is **configurable by invoice date** (since GST slabs changed in September 2025) and verified against official CBIC notifications.
+4. **Extraction mode:** **Synchronous** extraction (one request per uploaded file, with a per-file progress indicator in the UI) is used for the MVP.
+5. **Data retention:** Invoice rows (`invoices`, `invoice_line_items`) are retained for duplicate detection (`INV-DUP-001`). KYC checks are **auto-deleted after a configurable number of days** (`KYC_RETENTION_DAYS` in `.env`, default `7`).
